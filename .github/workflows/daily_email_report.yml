@@ -1,0 +1,46 @@
+name: Daily Email Report
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 7:00 AM Colombia (UTC-5) = 12:00 UTC
+    - cron: "0 12 * * *"
+
+concurrency:
+  group: daily-email-report
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Send daily email report
+        env:
+          TZ: America/Bogota
+          PYTHONUNBUFFERED: "1"
+          PG_DSN: ${{ secrets.PG_DSN }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
+        run: |
+          python daily_email_report.py
