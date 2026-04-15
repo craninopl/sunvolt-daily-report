@@ -68,16 +68,6 @@ Q_MONTHLY = """
     GROUP BY pd.device_sn
 """
 
-Q_ACTIVE_ALARMS = """
-    SELECT COUNT(*) FROM api_alarms WHERE resolved = FALSE
-"""
-
-Q_RECENT_ANOMALIES = """
-    SELECT COUNT(*) FROM native_anomalies
-    WHERE resolved = FALSE AND timestamp >= %(since)s
-"""
-
-
 def fetch_report_data(conn, report_date):
     month_start = report_date.replace(day=1)
     days_in_range = (report_date - month_start).days + 1
@@ -87,18 +77,6 @@ def fetch_report_data(conn, report_date):
     df_daily = pd.read_sql(Q_DAILY, conn, params=params)
     df_monthly = pd.read_sql(Q_MONTHLY, conn, params=params)
 
-    # Alarmas activas
-    active_alarms = 0
-    recent_anomalies = 0
-    try:
-        with conn.cursor() as cur:
-            cur.execute(Q_ACTIVE_ALARMS)
-            active_alarms = cur.fetchone()[0]
-            cur.execute(Q_RECENT_ANOMALIES, {'since': report_date})
-            recent_anomalies = cur.fetchone()[0]
-    except Exception:
-        pass  # Tablas pueden no existir en algunos entornos
-
     return {
         'report_date': report_date,
         'month_start': month_start,
@@ -106,8 +84,6 @@ def fetch_report_data(conn, report_date):
         'df_plants': df_plants,
         'df_daily': df_daily,
         'df_monthly': df_monthly,
-        'active_alarms': active_alarms,
-        'recent_anomalies': recent_anomalies,
     }
 
 
@@ -197,6 +173,23 @@ def process_data(data):
     gen_mes_meta = df_m['meta'].sum()
     pr_mes = calc_performance(gen_mes_real, gen_mes_meta)
 
+    # --- Breakdown por Patrimonio Autonomo (mensual) ---
+    df_m['pa_group'] = df_m['patrimonio'].fillna('').astype(str).str.strip().apply(
+        lambda p: p if p in ('PA1', 'PA2') else 'Otros'
+    )
+    pa_monthly = df_m.groupby('pa_group').agg(
+        gen_kwh=('energia_kwh', 'sum'),
+        meta_kwh=('meta', 'sum'),
+        count=('nombre', 'size'),
+        potencia=('potencia_instalada_kwp', 'sum'),
+    ).reset_index()
+    pa_monthly['pr'] = pa_monthly.apply(
+        lambda r: calc_performance(r['gen_kwh'], r['meta_kwh']), axis=1
+    )
+    order = {'PA1': 0, 'PA2': 1, 'Otros': 2}
+    pa_monthly['_ord'] = pa_monthly['pa_group'].map(order)
+    pa_monthly = pa_monthly.sort_values('_ord').drop(columns='_ord').reset_index(drop=True)
+
     # Tabla completa de plantas (diario)
     plant_table = df_d[['nombre', 'marca_origen', 'estado', 'potencia_instalada_kwp',
                         'energia_kwh', 'meta', 'performance']].sort_values('energia_kwh', ascending=False)
@@ -217,11 +210,10 @@ def process_data(data):
         'brand_daily': brand_daily,
         'offline': offline,
         'plant_table': plant_table,
+        'pa_monthly': pa_monthly,
         'report_date': data['report_date'],
         'month_start': data['month_start'],
         'days_in_range': data['days_in_range'],
-        'active_alarms': data['active_alarms'],
-        'recent_anomalies': data['recent_anomalies'],
     }
 
 
@@ -346,13 +338,19 @@ def build_html(kpis):
             </td>
         </tr>"""
 
-    # --- Alertas badge ---
-    alarms_total = kpis['active_alarms'] + kpis['recent_anomalies']
-    alarm_color = RED if alarms_total > 0 else GREEN
-    alarm_text = f"{alarms_total} alertas activas" if alarms_total > 0 else "Sin alertas"
-    alarm_detail = ""
-    if alarms_total > 0:
-        alarm_detail = f'<div style="color:{MUTED}; font-size:11px; margin-top:2px;">{kpis["active_alarms"]} de fabricante + {kpis["recent_anomalies"]} anomalias</div>'
+    # --- Filas PA ---
+    rows_pa = ""
+    for i, row in kpis['pa_monthly'].iterrows():
+        bg = ROW_ALT if i % 2 else DARK_BG
+        pc = color_pr(row['pr'])
+        rows_pa += f"""
+        <tr style="background-color:{bg};">
+            <td style="padding:8px 12px; color:{TEXT}; font-weight:bold;">{row['pa_group']}</td>
+            <td style="padding:8px 12px; color:white; text-align:right;">{fmt(row['gen_kwh'])} kWh</td>
+            <td style="padding:8px 12px; color:{MUTED}; text-align:right;">{fmt(row['meta_kwh'])} kWh</td>
+            <td style="padding:8px 12px; color:{pc}; text-align:right; font-weight:bold;">{row['pr']:.1f}%</td>
+            <td style="padding:8px 12px; color:{MUTED}; text-align:center; font-size:11px;">{int(row['count'])} ({row['potencia']:,.0f} kWp)</td>
+        </tr>"""
 
     # --- Full plant table ---
     rows_plant = ""
@@ -415,18 +413,11 @@ def build_html(kpis):
                         </td>
                     </tr>
                     <tr>
-                        <td width="50%" style="padding:0 6px 0 0; vertical-align:top;">
+                        <td colspan="2" style="padding:0; vertical-align:top;">
                             <div style="background-color:{DARK_BG}; border-radius:8px; padding:16px; border-left:3px solid {GOLD};">
                                 <div style="color:{MUTED}; font-size:10px; text-transform:uppercase; letter-spacing:1px;">Infraestructura</div>
                                 <div style="color:white; font-size:22px; font-weight:bold; margin-top:4px;">{kpis['plantas_operando']} <span style="font-size:13px; color:{MUTED};">/ {kpis['total_plants']} plantas</span></div>
                                 <div style="color:{MUTED}; font-size:12px; margin-top:4px;">Potencia total: {kpis['potencia_total']:,.1f} kWp</div>
-                            </div>
-                        </td>
-                        <td width="50%" style="padding:0 0 0 6px; vertical-align:top;">
-                            <div style="background-color:{DARK_BG}; border-radius:8px; padding:16px; border-left:3px solid {alarm_color};">
-                                <div style="color:{MUTED}; font-size:10px; text-transform:uppercase; letter-spacing:1px;">Estado de Alertas</div>
-                                <div style="color:{alarm_color}; font-size:22px; font-weight:bold; margin-top:4px;">{alarm_text}</div>
-                                {alarm_detail}
                             </div>
                         </td>
                     </tr>
@@ -461,6 +452,25 @@ def build_html(kpis):
                         <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:center;">PLANTAS</th>
                     </tr>
                     {rows_brand}
+                </table>
+            </td>
+        </tr>
+
+        <!-- BREAKDOWN POR PATRIMONIO AUTONOMO -->
+        <tr>
+            <td style="padding:0 30px 20px 30px;">
+                <div style="color:{GOLD}; font-size:13px; font-weight:bold; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">
+                    &#127970; Generacion por Patrimonio Autonomo — {month_str}
+                </div>
+                <table width="100%" cellpadding="0" cellspacing="0" style="background-color:{DARK_BG}; border-radius:8px; overflow:hidden;">
+                    <tr style="background-color:rgba(255,193,7,0.1);">
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:left;">PATRIMONIO</th>
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:right;">REAL</th>
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:right;">META</th>
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:right;">CUMPL.</th>
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:center;">PLANTAS</th>
+                    </tr>
+                    {rows_pa}
                 </table>
             </td>
         </tr>
@@ -565,7 +575,10 @@ def build_html(kpis):
 # ==========================================
 
 def send_email(html_body, report_date):
-    recipient = os.getenv('REPORT_RECIPIENT')
+    recipients_raw = os.getenv('REPORT_RECIPIENT', '')
+    recipients = [r.strip() for r in recipients_raw.split(',') if r.strip()]
+    if not recipients:
+        raise ValueError("REPORT_RECIPIENT vacio o mal formado")
     subject = f"SunVolt | Reporte Diario {report_date.strftime('%d/%m/%Y')}"
 
     # Intentar Resend API primero (funciona en VPS donde SMTP está bloqueado)
@@ -576,7 +589,7 @@ def send_email(html_body, report_date):
             headers={'Authorization': f'Bearer {resend_key}', 'Content-Type': 'application/json'},
             json={
                 'from': os.getenv('RESEND_FROM', 'SunVolt Reportes <reportes@sunvolt.com.co>'),
-                'to': [recipient],
+                'to': recipients,
                 'subject': subject,
                 'html': html_body,
             },
@@ -592,19 +605,19 @@ def send_email(html_body, report_date):
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From'] = f"SunVolt Reportes <{smtp_user}>"
-    msg['To'] = recipient
+    msg['To'] = ', '.join(recipients)
     msg.attach(MIMEText(html_body, 'html'))
 
     try:
         with smtplib.SMTP('smtp.gmail.com', 587) as server:
             server.starttls()
             server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [recipient], msg.as_string())
+            server.sendmail(smtp_user, recipients, msg.as_string())
     except OSError:
         # Puerto 587 bloqueado, intentar 465
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [recipient], msg.as_string())
+            server.sendmail(smtp_user, recipients, msg.as_string())
 
 
 # ==========================================
@@ -637,7 +650,6 @@ def main():
     print(f"  Email enviado a {os.getenv('REPORT_RECIPIENT')}")
     print(f"  Gen dia: {kpis['gen_dia_real']:,.0f} kWh ({kpis['pr_dia']:.1f}%) | Gen mes: {kpis['gen_mes_real']:,.0f} kWh ({kpis['pr_mes']:.1f}%)")
     print(f"  Plantas operando: {kpis['plantas_operando']}/{kpis['total_plants']}")
-    print(f"  Alertas: {kpis['active_alarms']} fabricante + {kpis['recent_anomalies']} anomalias")
     print(f"  Plantas offline: {len(kpis['offline'])}")
 
 
