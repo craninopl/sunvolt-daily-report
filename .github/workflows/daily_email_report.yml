@@ -3,8 +3,10 @@ name: Daily Email Report
 on:
   workflow_dispatch:
   schedule:
-    # 7:00 AM Colombia (UTC-5) = 12:00 UTC
+    # Primary: 7:00 AM Colombia (UTC-5) = 12:00 UTC
     - cron: "0 12 * * *"
+    # Retry: 8:00 AM Colombia = 13:00 UTC (skipped if primary already succeeded today)
+    - cron: "0 13 * * *"
 
 concurrency:
   group: daily-email-report
@@ -12,9 +14,40 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - name: Decide if this run should send
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          if [ "${{ github.event.schedule }}" != "0 13 * * *" ]; then
+            echo "Trigger != retry cron — proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          today=$(date -u +%Y-%m-%d)
+          count=$(gh api "repos/${{ github.repository }}/actions/workflows/daily_email_report.yml/runs?event=schedule&per_page=30" \
+            --jq "[.workflow_runs[] | select(.created_at | startswith(\"$today\")) | select(.conclusion == \"success\")] | length")
+          if [ "$count" -gt 0 ]; then
+            echo "Primary run already succeeded today — skipping retry."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No success today yet — running retry."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   send-report:
+    needs: preflight
+    if: needs.preflight.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -44,3 +77,37 @@ jobs:
           REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
         run: |
           python daily_email_report.py
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CRON_TYPE: ${{ github.event.schedule || 'manual' }}
+        run: |
+          python - <<'PY'
+          import os
+          import smtplib
+          from email.mime.text import MIMEText
+
+          run_url = os.environ["RUN_URL"]
+          cron_type = os.environ["CRON_TYPE"]
+          body = f"""SunVolt Daily Report fallo.
+
+          Trigger: {cron_type}
+          Run: {run_url}
+
+          Revisa los logs. Si el cron de retry (13:00 UTC) tampoco funciona,
+          puedes disparar manualmente con:
+            gh workflow run daily_email_report.yml --repo craninopl/sunvolt-daily-report
+          """
+          msg = MIMEText(body)
+          msg["Subject"] = "[ALERT] SunVolt Daily Report - workflow fallo"
+          msg["From"] = os.environ["SMTP_USER"]
+          msg["To"] = os.environ["SMTP_USER"]
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+              s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+              s.send_message(msg)
+          print(f"Failure notification sent to {os.environ['SMTP_USER']}")
+          PY
