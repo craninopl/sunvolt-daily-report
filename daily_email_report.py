@@ -55,17 +55,40 @@ Q_ALL_PLANTS = """
     ORDER BY nombre
 """
 
-Q_DAILY = """
-    SELECT pd.device_sn, pd.energia_kwh
-    FROM produccion_diaria pd
-    WHERE pd.fecha = %(report_date)s
+# --- Mapeo dispositivo->planta (incluye plantas hibridas) -------------------
+# Algunas plantas (ej. CDA La 30 id_externo=2602400) reciben generacion de
+# varias plataformas: una fila plant-level (device_sn = id_externo, Growatt) y
+# filas inverter-level (device_sn = inverter_metadata.inverter_id, AuroraVision/
+# FIMER). El cruce ingenuo `device_sn = id_externo` descartaba las filas
+# inverter-level y subreportaba la planta (CDA La 30: 21% vs 93% real).
+# Este CTE replica el mapeo de la RPC get_plants_summary (plant_devices):
+# inverter_metadata.plant_id == plantas.id_externo. El alias `device_sn` deja
+# intacto el merge de pandas aguas abajo (right_on='device_sn_trim').
+Q_PLANT_DEVICES = """
+    SELECT p.id_externo AS plant_key, p.id_externo AS device_sn
+    FROM plantas p
+    UNION ALL
+    SELECT im.plant_id AS plant_key, im.inverter_id AS device_sn
+    FROM inverter_metadata im
+    WHERE im.inverter_id <> im.plant_id
 """
 
-Q_MONTHLY = """
-    SELECT pd.device_sn, SUM(pd.energia_kwh) AS energia_kwh
-    FROM produccion_diaria pd
+Q_DAILY = f"""
+    WITH plant_devices AS ({Q_PLANT_DEVICES})
+    SELECT pdv.plant_key AS device_sn, SUM(pd.energia_kwh) AS energia_kwh
+    FROM plant_devices pdv
+    JOIN produccion_diaria pd ON pd.device_sn = pdv.device_sn
+    WHERE pd.fecha = %(report_date)s
+    GROUP BY pdv.plant_key
+"""
+
+Q_MONTHLY = f"""
+    WITH plant_devices AS ({Q_PLANT_DEVICES})
+    SELECT pdv.plant_key AS device_sn, SUM(pd.energia_kwh) AS energia_kwh
+    FROM plant_devices pdv
+    JOIN produccion_diaria pd ON pd.device_sn = pdv.device_sn
     WHERE pd.fecha >= %(month_start)s AND pd.fecha <= %(report_date)s
-    GROUP BY pd.device_sn
+    GROUP BY pdv.plant_key
 """
 
 def fetch_report_data(conn, report_date):
