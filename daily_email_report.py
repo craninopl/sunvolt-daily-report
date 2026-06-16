@@ -167,8 +167,10 @@ def process_data(data):
     top3_gen = df_con_datos.nlargest(3, 'energia_kwh')[
         ['nombre', 'marca_origen', 'energia_kwh']].reset_index(drop=True)
 
-    # Top 3 performance (excluir legalización)
-    df_perf = df_con_datos[df_con_datos['estado'].fillna('').str.lower() != 'legalizacion']
+    # Top 3 performance (excluir legalización y limitado: % no comparable)
+    # limitado = generación capada al consumo → su % real es bajo por diseño,
+    # no debe aparecer como "peor performance" (sí cuenta en agregados/tabla).
+    df_perf = df_con_datos[~df_con_datos['estado'].fillna('').str.lower().isin(['legalizacion', 'limitado'])]
     top3_perf = df_perf.nlargest(3, 'performance')[
         ['nombre', 'marca_origen', 'performance', 'energia_kwh', 'meta']].reset_index(drop=True)
 
@@ -454,7 +456,7 @@ def build_html(kpis):
                 <div style="background-color:rgba(255,193,7,0.08); border-radius:6px; padding:10px 14px; border:1px solid rgba(255,193,7,0.2);">
                     <span style="color:{GOLD}; font-size:12px;">&#9888;</span>
                     <span style="color:{MUTED}; font-size:11px; font-style:italic;">
-                        Los proyectos en legalizacion muestran 100% de cumplimiento ya que no tienen generacion estimada asignada hasta su legalizacion.
+                        Los proyectos en legalizacion muestran 100% de cumplimiento (meta = generacion real). Las plantas 'limitado' tienen su generacion capada al consumo del cliente: muestran su % real en la tabla y agregados, pero se excluyen de los rankings Top/Bottom porque su bajo % es por diseno, no una falla.
                     </span>
                 </div>
             </td>
