@@ -111,3 +111,33 @@ jobs:
               s.send_message(msg)
           print(f"Failure notification sent to {os.environ['SMTP_USER']}")
           PY
+
+  # Evita que GitHub deshabilite el cron por inactividad (60 dias sin commits).
+  # Ver: workflow quedo en 'disabled_inactivity' el 2026-08-16 y el reporte dejo de llegar.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Touch marker if repo has been idle > 20 days
+        run: |
+          set -e
+          last=$(git log -1 --format=%ct)
+          now=$(date -u +%s)
+          days=$(( (now - last) / 86400 ))
+          echo "Ultimo commit hace ${days} dia(s)."
+          if [ "$days" -lt 20 ]; then
+            echo "Repo activo — no hace falta keepalive."
+            exit 0
+          fi
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/last-keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/last-keepalive
+          git commit -m "chore: keepalive — evita disabled_inactivity del cron"
+          git push
