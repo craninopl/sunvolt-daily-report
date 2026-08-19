@@ -52,6 +52,10 @@ Q_ALL_PLANTS = """
     SELECT id_externo, nombre, marca_origen, potencia_instalada_kwp,
            hsp_teorico, estado, patrimonio
     FROM plantas
+    -- Excluir plantas retiradas de la flota (EPC fuera de alcance, contratos
+    -- terminados). Antes salian en el correo con 0 kWh y 0% arrastrando el
+    -- promedio y confundiendo al lector (casos: La Gran Esquina, Agris).
+    WHERE COALESCE(estado, '') <> 'desvinculada'
     ORDER BY nombre
 """
 
