@@ -50,7 +50,7 @@ def get_db():
 
 Q_ALL_PLANTS = """
     SELECT id_externo, nombre, marca_origen, potencia_instalada_kwp,
-           hsp_teorico, estado, patrimonio
+           hsp_teorico, estado, patrimonio, pao
     FROM plantas
     -- Excluir plantas retiradas de la flota (EPC fuera de alcance, contratos
     -- terminados). Antes salian en el correo con 0 kWh y 0% arrastrando el
@@ -219,6 +219,23 @@ def process_data(data):
     pa_monthly['_ord'] = pa_monthly['pa_group'].map(order)
     pa_monthly = pa_monthly.sort_values('_ord').drop(columns='_ord').reset_index(drop=True)
 
+    # --- Breakdown por PAO Bancavalor (mensual) — categoria SEPARADA de PA1/PA2 ---
+    df_m['pao_group'] = df_m['pao'].fillna('').astype(str).str.strip().apply(
+        lambda p: p if p in ('PAO 1', 'PAO 2') else 'Otros'
+    )
+    pao_monthly = df_m.groupby('pao_group').agg(
+        gen_kwh=('energia_kwh', 'sum'),
+        meta_kwh=('meta', 'sum'),
+        count=('nombre', 'size'),
+        potencia=('potencia_instalada_kwp', 'sum'),
+    ).reset_index()
+    pao_monthly['pr'] = pao_monthly.apply(
+        lambda r: calc_performance(r['gen_kwh'], r['meta_kwh']), axis=1
+    )
+    pao_order = {'PAO 1': 0, 'PAO 2': 1, 'Otros': 2}
+    pao_monthly['_ord'] = pao_monthly['pao_group'].map(pao_order)
+    pao_monthly = pao_monthly.sort_values('_ord').drop(columns='_ord').reset_index(drop=True)
+
     # Tabla completa de plantas (diario)
     plant_table = df_d[['nombre', 'marca_origen', 'estado', 'potencia_instalada_kwp',
                         'energia_kwh', 'meta', 'performance']].sort_values('energia_kwh', ascending=False)
@@ -240,6 +257,7 @@ def process_data(data):
         'offline': offline,
         'plant_table': plant_table,
         'pa_monthly': pa_monthly,
+        'pao_monthly': pao_monthly,
         'report_date': data['report_date'],
         'month_start': data['month_start'],
         'days_in_range': data['days_in_range'],
@@ -381,6 +399,20 @@ def build_html(kpis):
             <td style="padding:8px 12px; color:{MUTED}; text-align:center; font-size:11px;">{int(row['count'])} ({row['potencia']:,.0f} kWp)</td>
         </tr>"""
 
+    # --- Filas PAO Bancavalor ---
+    rows_pao = ""
+    for i, row in kpis['pao_monthly'].iterrows():
+        bg = ROW_ALT if i % 2 else DARK_BG
+        pc = color_pr(row['pr'])
+        rows_pao += f"""
+        <tr style="background-color:{bg};">
+            <td style="padding:8px 12px; color:{TEXT}; font-weight:bold;">{row['pao_group']}</td>
+            <td style="padding:8px 12px; color:white; text-align:right;">{fmt(row['gen_kwh'])} kWh</td>
+            <td style="padding:8px 12px; color:{MUTED}; text-align:right;">{fmt(row['meta_kwh'])} kWh</td>
+            <td style="padding:8px 12px; color:{pc}; text-align:right; font-weight:bold;">{row['pr']:.1f}%</td>
+            <td style="padding:8px 12px; color:{MUTED}; text-align:center; font-size:11px;">{int(row['count'])} ({row['potencia']:,.0f} kWp)</td>
+        </tr>"""
+
     # --- Full plant table ---
     rows_plant = ""
     for i, (_, row) in enumerate(kpis['plant_table'].iterrows()):
@@ -500,6 +532,25 @@ def build_html(kpis):
                         <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:center;">PLANTAS</th>
                     </tr>
                     {rows_pa}
+                </table>
+            </td>
+        </tr>
+
+        <!-- BREAKDOWN POR PAO BANCAVALOR -->
+        <tr>
+            <td style="padding:0 30px 20px 30px;">
+                <div style="color:{GOLD}; font-size:13px; font-weight:bold; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">
+                    &#127974; Generacion por PAO Bancavalor — {month_str}
+                </div>
+                <table width="100%" cellpadding="0" cellspacing="0" style="background-color:{DARK_BG}; border-radius:8px; overflow:hidden;">
+                    <tr style="background-color:rgba(255,193,7,0.1);">
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:left;">PAO</th>
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:right;">REAL</th>
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:right;">META</th>
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:right;">CUMPL.</th>
+                        <th style="padding:8px 12px; color:{GOLD}; font-size:10px; text-align:center;">PLANTAS</th>
+                    </tr>
+                    {rows_pao}
                 </table>
             </td>
         </tr>
