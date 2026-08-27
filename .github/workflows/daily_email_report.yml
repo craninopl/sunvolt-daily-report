@@ -2,12 +2,21 @@ name: Daily Email Report
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Reenviar aunque el informe de hoy ya se haya enviado (salta el guard de idempotencia)"
+        type: boolean
+        required: false
+        default: false
   schedule:
-    # Primary: 7:00 AM Colombia (UTC-5) = 12:00 UTC
+    # Los 3 crons son equivalentes: el guard de idempotencia del preflight decide
+    # si se envia. El que llegue primero envia; los demas (y cualquier corrida
+    # retrasada o manual sin force) se saltan.
+    # 7:00 AM Colombia (UTC-5) = 12:00 UTC
     - cron: "0 12 * * *"
-    # Retry: 8:00 AM Colombia = 13:00 UTC (skipped if primary already succeeded today)
+    # 8:00 AM Colombia = 13:00 UTC
     - cron: "0 13 * * *"
-    # Retry 2: 9:00 AM Colombia = 14:00 UTC (2026-08-27: GitHub se salto AMBOS crons un dia entero)
+    # 9:00 AM Colombia = 14:00 UTC (2026-08-27: GitHub se salto AMBOS crons un dia entero)
     - cron: "0 14 * * *"
 
 concurrency:
@@ -19,6 +28,18 @@ permissions:
   actions: read
 
 jobs:
+  # Guard de idempotencia — incidente 2026-08-27: GitHub se salto los crons de la
+  # manana (12:00 y 13:00 UTC), el informe se envio a mano (workflow_dispatch,
+  # 18:54 UTC) y a las 21:31 UTC GitHub ejecuto con ~9h de retraso uno de los
+  # crons saltados y DUPLICO el correo del dia. El preflight anterior decidia por
+  # CUAL cron desperto la corrida (primario 12h = enviar siempre; 13h/14h =
+  # retry), asi que una corrida retrasada del cron primario reenviaba, y ademas
+  # su chequeo de retry solo miraba event=schedule (un envio MANUAL no contaba)
+  # y la conclusion del WORKFLOW (una corrida con send-report skipped concluye
+  # success igual). Este guard subsume esa distincion primario/retry: TODOS los
+  # disparos (12h, 13h, 14h y manual sin force) pasan por la misma pregunta:
+  # "¿ya hubo HOY (fecha America/Bogota) una corrida cuyo JOB send-report
+  # concluyera success?" — si si, no se reenvia.
   preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -29,21 +50,61 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE: ${{ inputs.force }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
         run: |
-          set -e
-          if [ -z "${{ github.event.schedule }}" ] || [ "${{ github.event.schedule }}" = "0 12 * * *" ]; then
-            echo "Trigger != retry cron — proceeding."
+          set -euo pipefail
+
+          # Override deliberado para reenvios: workflow_dispatch con force=true.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
+            echo "force=true — se salta el guard de idempotencia (reenvio deliberado)."
             echo "proceed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          today=$(date -u +%Y-%m-%d)
-          count=$(gh api "repos/${{ github.repository }}/actions/workflows/daily_email_report.yml/runs?event=schedule&per_page=30" \
-            --jq "[.workflow_runs[] | select(.created_at | startswith(\"$today\")) | select(.conclusion == \"success\")] | length")
-          if [ "$count" -gt 0 ]; then
-            echo "Primary run already succeeded today — skipping retry."
+
+          # Fecha del informe = HOY en America/Bogota. Los crons de 12:00-14:00 UTC
+          # caen a las 7:00-9:00 a.m. del MISMO dia en Bogota; una corrida a las
+          # 03:00 UTC seria las 10 p.m. de Bogota del dia ANTERIOR — por eso el
+          # created_at de cada corrida se convierte a fecha Bogota antes de comparar.
+          today=$(TZ=America/Bogota date +%F)
+
+          # Historial reciente de ESTE workflow, cualquier trigger (un envio manual
+          # TAMBIEN cuenta como "ya se envio hoy"). Si el API falla: fail-open
+          # (proceder) — preferimos un posible duplicado a un dia sin informe.
+          if ! runs=$(gh api "repos/${REPO}/actions/workflows/daily_email_report.yml/runs?per_page=30" \
+              --jq '.workflow_runs[] | "\(.id) \(.created_at)"'); then
+            echo "WARN: no se pudo consultar el historial de corridas — se procede (fail-open)."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sent=""
+          while IFS=' ' read -r run_id created_at; do
+            [ -n "$run_id" ] || continue
+            [ "$run_id" = "$CURRENT_RUN_ID" ] && continue
+            run_day=$(TZ=America/Bogota date -d "$created_at" +%F) || continue
+            # La lista viene ordenada desc por created_at: al llegar a un dia
+            # anterior a hoy (Bogota) ya no hay nada mas que mirar.
+            [[ "$run_day" < "$today" ]] && break
+            [ "$run_day" = "$today" ] || continue
+            # Cuenta SOLO si el JOB send-report concluyo success: una corrida donde
+            # send-report quedo skipped (este mismo guard) o fallo NO envio nada.
+            # OJO: se busca el job por nombre — si se renombra el job, actualizar aqui.
+            n=$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs?per_page=50" \
+              --jq '[.jobs[] | select(.name == "send-report" and .conclusion == "success")] | length') || n=0
+            if [ "${n:-0}" -gt 0 ]; then
+              sent="run ${run_id} (created_at ${created_at})"
+              break
+            fi
+          done <<< "$runs"
+
+          if [ -n "$sent" ]; then
+            echo "El informe de hoy ($today Bogota) ya se envio: $sent — corrida duplicada/retrasada, no se reenvia."
             echo "proceed=false" >> "$GITHUB_OUTPUT"
           else
-            echo "No success today yet — running retry."
+            echo "Sin envio exitoso hoy ($today Bogota) — se procede a enviar."
             echo "proceed=true" >> "$GITHUB_OUTPUT"
           fi
 
