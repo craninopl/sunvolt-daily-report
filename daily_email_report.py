@@ -22,6 +22,10 @@ from dotenv import load_dotenv
 
 COL_TZ = timezone(timedelta(hours=-5))
 
+# Universo de negocio (EPC F0, 2026-09-29): el correo diario reporta solo la flota
+# con plantas.modelo_negocio = este valor (default 'PPA'; perfil EPC ⇒ env EPC).
+MODELO_NEGOCIO = os.getenv("SUNVOLT_MODELO_NEGOCIO", "").strip().upper() or "PPA"
+
 def load_config():
     # En GitHub Actions las env vars se inyectan directamente.
     # En local, intentar cargar desde archivos .env si existen.
@@ -53,9 +57,10 @@ Q_ALL_PLANTS = """
            hsp_teorico, estado, patrimonio, pao
     FROM plantas
     -- Excluir plantas retiradas de la flota (EPC fuera de alcance, contratos
-    -- terminados). Antes salian en el correo con 0 kWh y 0% arrastrando el
+    -- terminados). Antes salian en el correo con 0 kWh y 0 por ciento arrastrando el
     -- promedio y confundiendo al lector (casos: La Gran Esquina, Agris).
     WHERE COALESCE(estado, '') <> 'desvinculada'
+      AND modelo_negocio = %(modelo)s
     ORDER BY nombre
 """
 
@@ -71,10 +76,12 @@ Q_ALL_PLANTS = """
 Q_PLANT_DEVICES = """
     SELECT p.id_externo AS plant_key, p.id_externo AS device_sn
     FROM plantas p
+    WHERE p.modelo_negocio = %(modelo)s
     UNION ALL
     SELECT im.plant_id AS plant_key, im.inverter_id AS device_sn
     FROM inverter_metadata im
     WHERE im.inverter_id <> im.plant_id
+      AND im.plant_id IN (SELECT id_externo FROM plantas WHERE modelo_negocio = %(modelo)s)
 """
 
 Q_DAILY = f"""
@@ -98,9 +105,10 @@ Q_MONTHLY = f"""
 def fetch_report_data(conn, report_date):
     month_start = report_date.replace(day=1)
     days_in_range = (report_date - month_start).days + 1
-    params = {'report_date': report_date, 'month_start': month_start}
+    params = {'report_date': report_date, 'month_start': month_start,
+              'modelo': MODELO_NEGOCIO}
 
-    df_plants = pd.read_sql(Q_ALL_PLANTS, conn)
+    df_plants = pd.read_sql(Q_ALL_PLANTS, conn, params={'modelo': MODELO_NEGOCIO})
     df_daily = pd.read_sql(Q_DAILY, conn, params=params)
     df_monthly = pd.read_sql(Q_MONTHLY, conn, params=params)
 
